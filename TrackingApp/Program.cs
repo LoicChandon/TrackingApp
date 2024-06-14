@@ -1,13 +1,21 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Newtonsoft.Json.Linq;
 using Newtonsoft.Json;
 using NidRpc;
 using NurApiDotNet;
+using Microsoft.Extensions.DependencyInjection;
+
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+
+
+
 
 namespace TrackingApp
 {
@@ -26,6 +34,50 @@ namespace TrackingApp
     class Application
     {
         //API in C# : link between the FR22 Reader and the application
+
+        #region CORS
+        public static IHostBuilder CreateHostBuilder(string[] args) =>
+        Host.CreateDefaultBuilder(args)
+            .ConfigureWebHostDefaults(webBuilder =>
+            {
+                webBuilder.ConfigureServices(services =>
+                {
+                    services.AddCors(options =>
+                    {
+                        options.AddPolicy("AllowAllOrigins",
+                            builder =>
+                            {
+                                builder.AllowAnyOrigin()
+                                       .AllowAnyMethod()
+                                       .AllowAnyHeader();
+                            });
+                    });
+
+                    services.AddControllers();
+                });
+
+                webBuilder.Configure(app =>
+                {
+                    var env = app.ApplicationServices.GetRequiredService<IHostEnvironment>();
+
+                    if (env.IsDevelopment())
+                    {
+                        app.UseDeveloperExceptionPage();
+                    }
+
+                    app.UseCors("AllowAllOrigins");
+
+                    app.UseRouting();
+
+                    app.UseEndpoints(endpoints =>
+                    {
+                        endpoints.MapControllers();
+                    });
+                });
+            });
+
+
+        #endregion
 
         class TagEntry
         {
@@ -370,11 +422,21 @@ namespace TrackingApp
 
         class Program
         {
-            static async Task Main()
-            {
-                var application = await Application.CreateInstanceAsync("TrackingApp");
-                application.Run();
-            }
+            //static async Task Main()
+            //{
+            //    var application = await Application.CreateInstanceAsync("TrackingApp");
+            //    application.Run();
+            //}
+            static async Task Main(string[] args)
+        {
+            var host = CreateHostBuilder(args).Build();
+
+            var application = await Application.CreateInstanceAsync("TrackingApp");
+            var runTask = Task.Run(() => application.Run());
+
+            await host.RunAsync();
+            await runTask;
+        }
         }
     }
 }
