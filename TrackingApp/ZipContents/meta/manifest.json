@@ -1,6 +1,6 @@
 {
-    "name": "TrackingApp",
-    "version": "1.0.0",
+    "name": "TrackingAppOnline",
+    "version": "2.0.0",
     "startup": {
         "exec_start": "mono bin/TrackingApp.exe",
         "default_autostart": "true",

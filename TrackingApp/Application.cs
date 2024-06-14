@@ -65,34 +65,258 @@ namespace TrackingApp
             }
         }
 
-        // Implement RPC callback methods here...
+        #region NUR_CALLBACKS
 
         private void NurConnectedEvent(object sender, NurApi.NurEventArgs e)
         {
-            // Handle NurApi connected event
+            _lock.Wait();
+            _connected = true;
+            _lock.Release();
+
+            var thread = new Thread(() =>
+            {
+                NurApi.ReaderInfo? readerInfo = null;
+                try
+                {
+                    readerInfo = _nur.GetReaderInfo();
+                }
+                catch (NurApiException ex)
+                {
+                    Console.WriteLine($"Failed to get reader info {ex.Message}");
+                }
+                _lock.Wait();
+                _readerInfo = readerInfo;
+                _lock.Release();
+            });
+            thread.SetApartmentState(ApartmentState.STA);
+            thread.Start();
         }
 
         private void NurDisconnectedEvent(object sender, NurApi.NurEventArgs e)
         {
-            // Handle NurApi disconnected event
+            _lock.Wait();
+            try
+            {
+                _connected = false;
+                _readerInfo = null;
+                _streamEnabled = false;
+                _tagsSeen.Clear();
+                _nStreamEvents = 0;
+            }
+            finally
+            {
+                _lock.Release();
+            }
         }
 
         private void OnInventoryStreamEvent(object sender, NurApi.InventoryStreamEventArgs ev)
         {
-            // Handle NurApi inventory stream event
+            NurApi.TagStorage nurStorage = _nur.GetTagStorage();
+            _lock.Wait();
+            try
+            {
+                if (!_streamEnabled)
+                {
+                    return;
+                }
+                // need to lock access to the tag storage object to
+                // prevent NurApi from updating it in the background
+                lock (nurStorage)
+                {
+                    foreach (NurApi.Tag tag in nurStorage)
+                    {
+                        if (_tagsSeen.TryGetValue(tag.epc, out TagEntry value))
+                        {
+                            value.antennaId = tag.antennaId;
+                            value.timeserie = DateTime.Now; //Update timeserie to get the most recent one
+                        }
+                        else
+                        {
+                            _tagsSeen[tag.epc] = new TagEntry()
+                            {
+                                epc = BitConverter.ToString(tag.epc).Replace("-", ""),
+                                antennaId = tag.antennaId,
+                                timeserie = DateTime.Now, // Initialize timeserie
+                            };
+                        }
+                    }
+                    // Clear NurApi internal tag storage so that we only get new tags next next time
+                    nurStorage.Clear();
+                }
+                // NurApi may disable the stream to prevent unnecessarily powering the radio
+                // (in case the application has stopped); start it again if that is the case
+                if (_streamEnabled && ev.data.stopped)
+                {
+                    StartTagStream();
+                }
+                _lastStreamEvent = DateTime.Now;
+                _nStreamEvents++;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine(ex.Message);
+            }
+            finally
+            {
+                _lock.Release();
+            }
         }
 
+        #endregion
+
+        #region RPC_CALLBACKS
+        private async Task<JObject> RfidConnected(object sender, CallbackEventArgs args)
+        {
+            await _lock.WaitAsync();
+            var connected = _connected ? "true" : "false";
+            var connectError = _connectError;
+            _lock.Release();
+
+            var ret = JObject.Parse($"{{'connected': {connected}}}");
+            if (connectError != null)
+            {
+                ret["connectError"] = connectError;
+            }
+            return ret;
+        }
         private void BackgroundConnect()
         {
-            // Implement background connection logic
+            var thread = new Thread(() =>
+            {
+                try
+                {
+                    _nur.ConnectSocket("127.0.0.1", 4332); //localhost + TCP port 4332
+                    _lock.Wait();
+                    _connectError = null;
+                    _lock.Release();
+                }
+                catch (NurApiException ex)
+                {
+                    _lock.Wait();
+                    _connectError = ex.Message;
+                    _lock.Release();
+                }
+            });
+            thread.SetApartmentState(ApartmentState.STA);
+            thread.Start();
         }
+        private async Task<JObject> RfidConnect(object sender, CallbackEventArgs args)
+        {
+            BackgroundConnect();
+            return await Task.FromResult(JObject.Parse("{}"));
+        }
+
+        private async Task<JObject> RfidDisconnect(object sender, CallbackEventArgs args)
+        {
+            var thread = new Thread(() =>
+            {
+                try
+                {
+                    _nur.Disconnect();
+                }
+                catch (NurApiException ex)
+                {
+                    _lock.Wait();
+                    _connectError = ex.Message;
+                    _lock.Release();
+                }
+            });
+            thread.SetApartmentState(ApartmentState.STA);
+            thread.Start();
+            return await Task.FromResult(JObject.Parse("{}"));
+        }
+
+
+        private async Task<JObject> TagsStartStream(object sender, CallbackEventArgs args)
+        {
+            await _lock.WaitAsync();
+            try
+            {
+                _streamEnabled = true;
+                _tagsSeen.Clear();
+                _nStreamEvents = 0;
+            }
+            finally
+            {
+                _lock.Release();
+            }
+            var thread = new Thread(() =>
+            {
+                try
+                {
+                    _nur.ClearTagsEx();
+                    StartTagStream();
+                }
+                catch (NurApiException ex)
+                {
+                    Console.WriteLine($"Failed to start tag reading {ex.Message}");
+                }
+            });
+            thread.SetApartmentState(ApartmentState.STA);
+            thread.Start();
+            return await Task.FromResult(JObject.Parse("{}"));
+        }
+        private async Task<JObject> TagsStopStream(object sender, CallbackEventArgs args)
+        {
+            await _lock.WaitAsync();
+            _streamEnabled = false;
+            _lock.Release();
+            var thread = new Thread(() =>
+            {
+                try
+                {
+                    _nur.StopInventoryStream();
+                }
+                catch (NurApiException ex)
+                {
+                    Console.WriteLine($"Failed to stop tag reading {ex.Message}");
+                }
+            });
+            thread.SetApartmentState(ApartmentState.STA);
+            thread.Start();
+            return await Task.FromResult(JObject.Parse("{}"));
+        }
+
+        private async Task<JObject> InventoryGet(object sender, CallbackEventArgs args)
+        {
+            int count;
+            uint nStreamEvents;
+            string streamEnabled = _streamEnabled ? "true" : "false";
+            var tags = new List<dynamic>(); //We use dynamic type to serialize timeseries under the correct format
+            await _lock.WaitAsync();
+            try
+            {
+                count = _tagsSeen.Count;
+                nStreamEvents = _nStreamEvents;
+                foreach (TagEntry tagEntry in _tagsSeen.Values)
+                {
+                    tags.Add(tagEntry);
+                }
+            }
+            finally
+            {
+                _lock.Release();
+            }
+
+            var jsonTxt = $"{{'count': {count}, 'nInventories': {nStreamEvents}, 'updateEnabled': {streamEnabled}, 'tags': {JsonConvert.SerializeObject(tags)}}}";
+            var ret = await Task.FromResult(JObject.Parse(jsonTxt));
+            if (_lastStreamEvent.HasValue)
+            {
+                ret["timestamp"] = _lastStreamEvent.Value.ToString("yyyy-MM-dd HH\\:mm\\:ss");
+            }
+            return ret;
+        }
+
+        #endregion
 
         private void StartTagStream()
         {
-            // Implement tag stream start logic
+            // TODO: fix when NUR_OPFLAGS_EN_PHASE_DIFF/NUR_DC_PHASEDIFF has been added to NurApiDotNet
+            // tag phase diff support (NUR_OPFLAGS_EN_PHASE_DIFF = (1 << 17)) isn't yet available in
+            // NurApiDotNet; just assume it is supported in the NUR module and turn it on
+            _nur.OpFlags |= (1 << 17);
+            _nur.StartInventoryStream();
         }
-
-        // Other methods...
 
         private class TagEntry
         {
